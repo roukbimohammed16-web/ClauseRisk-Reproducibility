@@ -1,0 +1,238 @@
+================================================================================
+ClauseRisk — Prompt templates (Supplementary Material)
+Manuscript: "Building a Multilingual Legal Risk Database and ClauseRisk Visual
+Analytics System for Contracts and Online Service Agreements" (Applied Sciences)
+Repository: https://doi.org/10.5281/zenodo.22834942
+================================================================================
+
+CONTENTS
+  1. Conventions
+  2. v1 — BM25 + GPT-4o-mini (single call)
+  3. v2 — HyDE, hybrid retrieval, few-shot, 3-vote self-consistency
+  4. v3 to v5 — five-vote GPT-4o classification
+  5. Revision experiments — released re-implementation and LLM-only baseline
+  6. Decision stage (v4, v5) — no prompt involved
+  7. Explanation prompt of the interactive platform
+
+--------------------------------------------------------------------------------
+1. CONVENTIONS
+--------------------------------------------------------------------------------
+- Placeholders are written in braces: {lang_name} is "English", "French" or
+  "Arabic" according to the detected language of the passage; {text} is the
+  passage to classify; {ctx} is the list of retrieved knowledge-base clauses.
+- Each retrieved clause is rendered on one line as:
+      [<clause id>] (risk=<low|medium|high>, cat=<risk category>): <clause text
+      in the language of the passage, falling back to English>
+- In the evaluation pipeline of every version (v1-v5), the model returns a
+  single JSON field:  {"overall_risk": "none|low|medium|high"}
+  (OpenAI JSON mode, response_format = {"type": "json_object"}).
+  An unparsable answer, or a value outside the four levels, is mapped to "low".
+- Passages are truncated to 1,500 characters (v1) or 1,200 characters (v2 and
+  later) in the user prompt; retrieved clauses to 250 (v1) or 200 characters.
+
+--------------------------------------------------------------------------------
+2. v1 — BM25 + GPT-4o-mini
+--------------------------------------------------------------------------------
+Model: gpt-4o-mini | temperature 0.1 | max_tokens 60 | JSON mode
+Retrieval: BM25 per language, top 12 clauses.
+
+[SYSTEM]
+You are a multilingual legal risk analyst grounded in Algerian law. Use ONLY the
+retrieved clauses. Respond ONLY with valid JSON: {"overall_risk": "none|low|medium|high"}.
+
+[USER]
+USER TEXT ({lang_name}):
+{text}
+
+RETRIEVED CLAUSES:
+{ctx}
+
+Output JSON:
+
+--------------------------------------------------------------------------------
+3. v2 — HyDE + hybrid retrieval + few-shot + self-consistency (3 votes)
+--------------------------------------------------------------------------------
+3.1 HyDE query expansion
+Model: gpt-4o-mini | temperature 0.3 | max_tokens 80 | plain text
+The generated clause is appended to the passage, and the combined text is used
+as the query for both BM25 and dense retrieval (RRF, k = 60, top 10).
+
+[USER]
+Given the following user clause in {lang_name}, write a SHORT hypothetical legal
+clause (1-2 sentences max) that would describe the same type of risk, using
+formal legal terminology. Output ONLY the hypothetical clause text, nothing else.
+
+User clause: {text[:500]}
+
+Hypothetical legal clause:
+
+3.2 Classification (one vote)
+Model: gpt-4o-mini | temperature 0.3 | max_tokens 50 | JSON mode
+
+[SYSTEM]
+You are an expert multilingual legal risk analyst specializing in Algerian law
+(Loi 18-07 data protection, Loi 09-03 consumer protection, Loi 18-05 e-commerce).
+
+CRITICAL CLASSIFICATION RULES:
+- HIGH: Direct violation of Algerian law OR explicit waiver of rights OR
+  international data transfer without ANPDP authorization OR abusive clause
+  forbidden by Loi 09-03
+- MEDIUM: Potential violation OR ambiguous clause OR insufficient transparency
+  OR unilateral modification
+- LOW: Standard compliant clause OR purely descriptive content
+- NONE: No legal content
+
+Be DECISIVE. When in doubt between MEDIUM and HIGH on cumulative violations,
+prefer HIGH (precautionary principle).
+Respond in {lang_name}. Output ONLY valid JSON.
+
+[USER]
+{FEW_SHOT_BLOCK}
+NOW CLASSIFY THIS USER TEXT:
+
+User clause: {text}
+
+Retrieved similar clauses from knowledge base:
+{ctx}
+
+Apply the same reasoning as the examples above. Output ONLY: {"overall_risk": "none|low|medium|high"}
+
+3.3 FEW_SHOT_BLOCK (fixed across all runs; used from v2 onward)
+Selection rule: the first two HIGH entries, the first two MEDIUM entries and the
+first LOW entry outside the "no match" category, in knowledge-base order:
+  1. cl_00055 (HIGH)
+  2. cl_00057 (HIGH)
+  3. cl_00002 (MEDIUM)
+  4. cl_00006 (MEDIUM)
+  5. cl_00053 (LOW)
+
+EXAMPLES (study these carefully):
+
+Example 1:
+Clause: We can transfer national security data to third parties as needed.
+Reasoning: Violation: Espionage/treason exposure (sovereign/defense/economic secrets) - Legal basis: قانون العقوبات – المواد 61 إلى 67
+Output: {"overall_risk": "high"}
+
+Example 2:
+Clause: We may transfer sovereign data to other countries if it is in the interests of our business parties.
+Reasoning: Violation: Espionage/treason exposure (sovereign/defense/economic secrets) | Personal data protection / privacy compliance risk - Legal basis: قانون العقوبات – المواد 61 إلى 67 | قانون 18-07 (حماية المعطيات ذات الطابع الشخص
+Output: {"overall_risk": "high"}
+
+Example 3:
+Clause: Disputes are interpreted in accordance with external law regardless of the location of the user.
+Reasoning: Concern: Choice-of-law / forum selection evasion
+Output: {"overall_risk": "medium"}
+
+Example 4:
+Clause: Any disputes between the parties shall be resolved in accordance with foreign law and not local law.
+Reasoning: Concern: Choice-of-law / forum selection evasion
+Output: {"overall_risk": "medium"}
+
+Example 5:
+Clause: We provide accurate geographic data to third parties outside the country without restriction.
+Reasoning: Standard compliant clause
+Output: {"overall_risk": "low"}
+
+3.4 Self-consistency (v2)
+Three votes: the first vote generates the HyDE expansion and performs retrieval;
+votes 2 and 3 reuse the same retrieved clauses. All three votes use the
+parameters of Section 3.2. Aggregation: simple majority; in case of a tie, the
+more severe level is chosen (precautionary tie-break).
+
+3.5 Class-prior adjustment (v2 only)
+If the share of passages predicted HIGH is more than 10 points below a target of
+0.45, MEDIUM predictions that received at least one HIGH vote are promoted to
+HIGH. On EVAL-EEM this changed one prediction (3-class F1 0.593 -> 0.603).
+
+--------------------------------------------------------------------------------
+4. v3 to v5 — five-vote GPT-4o classification
+--------------------------------------------------------------------------------
+Main classifier: gpt-4o | JSON mode | output {"overall_risk": ...}
+Secondary verification call: gpt-4o-mini, prompted to be skeptical of
+underestimated HIGH violations.
+Five votes with (temperature, perspective):
+  (0.0, legal), (0.3, legal), (0.5, consumer), (0.5, privacy), (0.7, legal)
+The temperature-0 vote is weighted x1.5 in the three-class aggregation
+(v3-FIXED). v4 and v5 apply decision rules to the same stored votes (Section 6).
+
+[AUTHORS: insert here the exact system and user prompts of the original v3
+notebook. If they are identical to Section 5 below, replace this note by
+"The v3 prompts are those of Section 5".]
+
+--------------------------------------------------------------------------------
+5. Revision experiments — released re-implementation and LLM-only baseline
+--------------------------------------------------------------------------------
+Used for (a) the three repeated runs of the pipeline and (b) the "GPT-4o without
+retrieval" baseline reported in the revised manuscript.
+Model: gpt-4o | max_tokens 60 | JSON mode | five votes as in Section 4.
+
+5.1 Perspective sentences
+  legal    : Reason as an Algerian legal practitioner applying the statutes literally.
+  consumer : Reason from the standpoint of consumer protection (Loi 09-03).
+  privacy  : Reason from the standpoint of personal-data protection (Loi 18-07).
+
+5.2 [SYSTEM] (identical for both settings)
+You are an expert multilingual legal risk analyst specializing in Algerian law
+(Loi 18-07 data protection, Loi 09-03 consumer protection, Loi 18-05 e-commerce,
+Penal Code).
+{perspective sentence}
+CLASSIFICATION RULES:
+- HIGH: direct violation of Algerian law OR explicit waiver of rights OR
+  international data transfer without authorization of the national authority
+  OR sensitive/biometric data without explicit consent OR abusive clause
+  forbidden by Loi 09-03 OR restriction of access to Algerian courts
+- MEDIUM: potential violation, ambiguous clause, insufficient transparency,
+  unilateral modification
+- LOW: standard compliant clause or purely descriptive content
+- NONE: no legal content
+When a clause engages several provisions at once, prefer HIGH (precautionary
+principle).
+The clause is in {lang_name}. Output ONLY valid JSON.
+
+5.3 [USER] — pipeline re-runs (with retrieval)
+HyDE (gpt-4o-mini, temperature 0.3, max_tokens 80, plain text):
+  Write a SHORT hypothetical legal clause (1-2 sentences) describing the same
+  type of risk as this clause. Output only the clause.
+
+  Clause: {text[:500]}
+
+Classification (retrieval query = passage + HyDE clause; BM25 per language +
+dense multilingual MiniLM on trilingual entries, RRF k = 60, top 10):
+  {FEW_SHOT_BLOCK, Section 3.3}
+
+  NOW CLASSIFY:
+  Clause: {text[:1200]}
+
+  Retrieved clauses:
+  {ctx}
+
+  Output ONLY: {"overall_risk": "none|low|medium|high"}
+
+5.4 [USER] — GPT-4o without retrieval
+  Clause:
+  {text[:1500]}
+
+  Output ONLY: {"overall_risk": "none|low|medium|high"}
+
+--------------------------------------------------------------------------------
+6. DECISION STAGE (v4, v5) — no prompt involved
+--------------------------------------------------------------------------------
+Binary task: RISKY = HIGH; NOT-RISKY = NONE, LOW or MEDIUM.
+Let n_HIGH be the number of HIGH votes among the K = 5 votes.
+  v4               : RISKY if n_HIGH >= 3
+  v5 (selected)    : RISKY if n_HIGH >= 1 OR the keyword veto fires
+                     (patterns in veto_patterns.txt)
+Confidence (Equation 2 of the manuscript): share of the five votes that agree
+with the emitted label, i.e. n_HIGH/5 if RISKY, 1 - n_HIGH/5 if NOT-RISKY.
+A prediction is emitted only if confidence >= tau; otherwise the passage is
+referred to human review.
+
+--------------------------------------------------------------------------------
+7. EXPLANATION PROMPT OF THE INTERACTIVE PLATFORM
+--------------------------------------------------------------------------------
+The interactive platform (not used for any reported metric) requests an extended
+JSON object with the fields risk_level, confidence, legal_basis (array of article
+references), triggers (array of matched spans) and reasoning (step-by-step
+explanation shown to the user). A response that does not parse, or that cites an
+article absent from the reference framework, is rejected and the call repeated.
+[AUTHORS: paste the platform prompt here, or delete this section.]
